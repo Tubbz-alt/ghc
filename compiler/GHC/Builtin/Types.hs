@@ -215,6 +215,41 @@ to this Note, so a search for this Note's name should find all the lists.
 
 See also Note [Getting from RuntimeRep to PrimRep] in GHC.Types.RepType.
 
+
+Note [Wired-in Types and Type Constructors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This module include a lot of wired-in types and type constructors. Here,
+these are presented in a tabular format to make it easier to find the
+wired-in type identifier corresponding to a known Haskell type. Data
+constructors are nested under their corresponding types with two spaces
+of indentation.
+
+Identifier              Type    Haskell name          Notes
+----------------------------------------------------------------------------
+liftedTypeKindTyCon     TyCon   GHC.Types.Type        Synonym for: TYPE LiftedRep
+liftedRepTyCon          TyCon   GHC.Types.LiftedRep   Synonym for: 'BoxedRep 'Lifted
+levityTyCon             TyCon   GHC.Types.Levity      Data type
+  liftedDataConTyCon    TyCon   GHC.Types.Lifted      Data constructor
+  unliftedDataConTyCon  TyCon   GHC.Types.Unlifted    Data constructor
+vecCountTyCon           TyCon   GHC.Types.VecCount    Data type
+  vec2DataConTy         Type    GHC.Types.Vec2        Data constructor
+  vec4DataConTy         Type    GHC.Types.Vec4        Data constructor
+  vec8DataConTy         Type    GHC.Types.Vec8        Data constructor
+  vec16DataConTy        Type    GHC.Types.Vec16       Data constructor
+  vec32DataConTy        Type    GHC.Types.Vec32       Data constructor
+  vec64DataConTy        Type    GHC.Types.Vec64       Data constructor
+runtimeRepTyCon         TyCon   GHC.Types.RuntimeRep  Data type
+  boxedRepDataConTyCon  TyCon   GHC.Types.BoxedRep    Data constructor
+  intRepDataConTy       Type    GHC.Types.IntRep      Data constructor
+  doubleRepDataConTy    Type    GHC.Types.DoubleRep   Data constructor
+  floatRepDataConTy     Type    GHC.Types.FloatRep    Data constructor
+boolTyCon               TyCon   GHC.Types.Bool        Data type
+  trueDataCon           DataCon GHC.Types.True        Data constructor
+  falseDataCon          DataCon GHC.Types.False       Data constructor
+  promotedTrueDataCon   TyCon   GHC.Types.True        Data constructor
+  promotedFalseDataCon  TyCon   GHC.Types.False       Data constructor
+
 ************************************************************************
 *                                                                      *
 \subsection{Wired in type constructors}
@@ -223,7 +258,9 @@ See also Note [Getting from RuntimeRep to PrimRep] in GHC.Types.RepType.
 
 If you change which things are wired in, make sure you change their
 names in GHC.Builtin.Names, so they use wTcQual, wDataQual, etc
+
 -}
+
 
 -- This list is used only to define GHC.Builtin.Utils.wiredInThings. That in turn
 -- is used to initialise the name environment carried around by the renamer.
