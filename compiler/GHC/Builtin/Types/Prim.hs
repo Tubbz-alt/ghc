@@ -451,26 +451,28 @@ Note [TYPE and RuntimeRep]
 All types that classify values have a kind of the form (TYPE rr), where
 
     data RuntimeRep     -- Defined in ghc-prim:GHC.Types
-      = LiftedRep
-      | UnliftedRep
+      = BoxedRep Levity
       | IntRep
       | FloatRep
       .. etc ..
+
+    data Levity = Lifted | Unlifted
 
     rr :: RuntimeRep
 
     TYPE :: RuntimeRep -> TYPE 'LiftedRep  -- Built in
 
 So for example:
-    Int        :: TYPE 'LiftedRep
-    Array# Int :: TYPE 'UnliftedRep
+    Int        :: TYPE ('BoxedRep 'Lifted)
+    Array# Int :: TYPE ('BoxedRep 'Unlifted)
     Int#       :: TYPE 'IntRep
     Float#     :: TYPE 'FloatRep
-    Maybe      :: TYPE 'LiftedRep -> TYPE 'LiftedRep
+    Maybe      :: TYPE ('BoxedRep 'Lifted) -> TYPE ('BoxedRep 'Lifted)
     (# , #)    :: TYPE r1 -> TYPE r2 -> TYPE (TupleRep [r1, r2])
 
 We abbreviate '*' specially:
-    type * = TYPE 'LiftedRep
+    type LiftedRep = 'BoxedRep 'Lifted
+    type * = TYPE LiftedRep
 
 The 'rr' parameter tells us how the value is represented at runtime.
 
