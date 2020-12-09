@@ -31,7 +31,7 @@ module GHC.Tc.Solver.Monad (
     panicTcS, traceTcS,
     traceFireTcS, bumpStepCountTcS, csTraceTcS,
     wrapErrTcS, wrapWarnTcS,
-    getUnificationFlag, setUnificationFlag,
+    resetUnificationFlag, setUnificationFlag,
 
     -- Evidence creation and transformation
     MaybeNew(..), freshGoals, isFresh, getEvExpr,
@@ -1512,12 +1512,24 @@ addInertForAll new_qci
   = do { ics  <- getInertCans
        ; ics1 <- add_qci ics
 
-       -- C.f add_given_eq
+       -- Update given equalities. Painful!  C.f updateGivenEqs
        ; tclvl <- getTcLevel
-       ; let ics2 | tclvl `strictlyDeeperThan` inert_given_eq_lvl ics1
-                  = ics1 { inert_given_eq_lvl = tclvl }
-                  | otherwise
-                  = ics1
+       ; let ics2 | not_equality = ics1
+                  | otherwise    = ics1 { inert_given_eq_lvl = ge_lvl'
+                                        , inert_given_eqs    = geqs' }
+             !(IC { inert_given_eq_lvl = ge_lvl
+                  , inert_given_eqs    = geqs }) = ics1
+
+             not_equality = isClassPred pred && not (isEqPred pred)
+                  -- True <=> definitely not an equality
+                  -- Heads like (f a) might be an equality
+
+             pred       = qci_pred new_qci
+             is_eq_pred = isEqPred pred  -- Definitely an equality
+             geqs'      = geqs || is_eq_pred
+
+             ge_lvl' | tclvl `strictlyDeeperThan` ge_lvl = tclvl
+                     | otherwise                         = ge_lvl
 
        ; setInertCans ics2 }
   where
@@ -1602,13 +1614,13 @@ add_item :: TcLevel -> InertCans -> Ct -> InertCans
 add_item tc_lvl
          ics@(IC { inert_funeqs = funeqs, inert_eqs = eqs })
          item@(CEqCan { cc_lhs = lhs })
-  = add_given_eq tc_lvl item $
+  = updateGivenEqs tc_lvl item $
     case lhs of
        TyFamLHS tc tys -> ics { inert_funeqs = addCanFunEq funeqs tc tys item }
        TyVarLHS tv     -> ics { inert_eqs    = addTyEq eqs tv item }
 
 add_item tc_lvl ics@(IC { inert_irreds = irreds }) item@(CIrredCan {})
-  = add_given_eq tc_lvl item $   -- An Irred might turn out to be an
+  = updateGivenEqs tc_lvl item $   -- An Irred might turn out to be an
                                  -- equality, so we play safe
     ics { inert_irreds = irreds `Bag.snocBag` item }
 
@@ -1619,15 +1631,15 @@ add_item _ _ item
   = pprPanic "upd_inert set: can't happen! Inserting " $
     ppr item   -- Can't be CNonCanonical because they only land in inert_irreds
 
-add_given_eq :: TcLevel -> Ct -> InertCans -> InertCans
+updateGivenEqs :: TcLevel -> Ct -> InertCans -> InertCans
 -- Set the inert_given_eq_level to the current level (tclvl)
 -- if the constraint is a given equality that should prevent
 -- filling in an outer unification variable.
 -- See See Note [When does an implication have given equalities?]
 --
 -- ToDo: what about Quantified Constraints?
-add_given_eq tclvl ct inerts@(IC { inert_given_eq_lvl = ge_lvl
-                                 , inert_given_eqs    = geqs })
+updateGivenEqs tclvl ct inerts@(IC { inert_given_eq_lvl = ge_lvl
+                                   , inert_given_eqs    = geqs })
   | not (isGivenCt ct) = inerts
   | not_equality ct    = inerts -- See Note [Let-bound skolems]
   | otherwise          = inerts { inert_given_eq_lvl = ge_lvl'
@@ -1651,7 +1663,9 @@ add_given_eq tclvl ct inerts@(IC { inert_given_eq_lvl = ge_lvl
 
     not_equality :: Ct -> Bool
     -- True <=> definitely not an equality of any kind
-    not_equality (CEqCan { cc_lhs = TyVarLHS tv }) = isLocalSkolem tclvl tv
+    --          except for a let-bound skolem, which doesn't count
+    --          See Note [Let-bound skolems]
+    not_equality (CEqCan { cc_lhs = TyVarLHS tv }) = not (isOuterTyVar tclvl tv)
     not_equality (CDictCan {})                     = True
     not_equality _                                 = False
 
@@ -2184,81 +2198,38 @@ getHasGivenEqs :: TcLevel           -- TcLevel of this implication
                       , Cts )       -- Insoluble equalities arising from givens
 -- See Note [When does an implication have given equalities?]
 getHasGivenEqs tclvl
-  = do { inerts@(IC { inert_irreds = irreds
---                    , inert_insts = qc_insts
---                    , inert_eqs = ieqs, inert_funeqs = funeqs
-                    , inert_given_eqs = given_eqs
+  = do { inerts@(IC { inert_irreds       = irreds
+                    , inert_given_eqs    = given_eqs
                     , inert_given_eq_lvl = ge_lvl })
               <- getInertCans
-{-
-       ; let has_given_eqs = foldMap check_local_given_ct irreds
-                        S.<> foldMap (lift_equal_ct_list check_local_given_tv_eq) ieqs
-                        S.<> foldMapFunEqs (lift_equal_ct_list check_local_given_ct) funeqs
-                        S.<> foldMap qc_eq_inst_given_here qc_insts
--}
        ; let insols = filterBag insolubleEqCt irreds
-                       -- Specifically includes ones that originated in some
+                      -- Specifically includes ones that originated in some
                       -- outer context but were refined to an insoluble by
                       -- a local equality; so do /not/ add ct_given_here.
+             has_ge | given_eqs       = LocalGivenEqs
+                    | ge_lvl == tclvl = MaybeGivenEqs
+                    | otherwise       = NoGivenEqs
+
        ; traceTcS "getHasGivenEqs" $
          vcat [ text "given_eqs:" <+> ppr given_eqs
               , text "ge_lvl:" <+> ppr ge_lvl
               , text "ambient level:" <+> ppr tclvl
               , text "Inerts:" <+> ppr inerts
               , text "Insols:" <+> ppr insols]
-       ; let has_ge | given_eqs       = LocalGivenEqs
---                    | ge_lvl == tclvl = MaybeGivenEqs
-                    | otherwise       = NoGivenEqs
        ; return (has_ge, insols) }
-  where
-{-
-    check_local_given_ct :: Ct -> HasGivenEqs
-    check_local_given_ct ct = check_local_given_ev (ctEvidence ct)
-
-    check_local_given_ev :: CtEvidence -> HasGivenEqs
-    check_local_given_ev ev
-      | not (given_bound_here ev) = NoGivenEqs
-      | mentionsOuterVar tclvl ev = MaybeGivenEqs
-      | otherwise                 = LocalGivenEqs
-
-    lift_equal_ct_list :: (Ct -> HasGivenEqs) -> EqualCtList -> HasGivenEqs
-    -- returns NoGivenEqs for non-singleton lists, as Given lists are always
-    -- singletons
-    lift_equal_ct_list check (EqualCtList (ct :| [])) = check ct
-    lift_equal_ct_list _     _                        = NoGivenEqs
-
-    check_local_given_tv_eq :: Ct -> HasGivenEqs
-    check_local_given_tv_eq (CEqCan { cc_lhs = TyVarLHS tv, cc_ev = ev})
-      | not (given_bound_here ev)    = NoGivenEqs
-      | not (isLocalSkolem tclvl tv) = MaybeGivenEqs
-      | otherwise                    = NoGivenEqs   -- See Note [Let-bound skolems]
-    check_local_given_tv_eq other_ct
-      = check_local_given_ct other_ct
-
-    qc_eq_inst_given_here :: QCInst -> HasGivenEqs
-    -- True of a quantified constraint (which are always Given)
-    -- for an equality, bound by this implication
-    qc_eq_inst_given_here (QCI { qci_ev = ev, qci_pred = pred })
-       | isEqPred pred = check_local_given_ev ev
-       | otherwise     = NoGivenEqs
-
-    given_bound_here :: CtEvidence -> Bool
-    -- True for a Given bound by the current implication,
-    -- i.e. the current level
-    given_bound_here ev =  isGiven ev
-                        && tclvl == ctLocLevel (ctEvLoc ev)
--}
 
 mentionsOuterVar :: TcLevel -> CtEvidence -> Bool
 mentionsOuterVar tclvl ev
-  = anyFreeVarsOfType (not . isLocalSkolem tclvl) $
+  = anyFreeVarsOfType (isOuterTyVar tclvl) $
     ctEvPred ev
 
-isLocalSkolem :: TcLevel -> TyCoVar -> Bool
-isLocalSkolem tclvl tv
-  | isTyVar tv = tclvl `sameDepthAs` tcTyVarLevel tv
-                       -- Includes CycleBreakerTvs which are meta-tyvars
-  | otherwise  = True  -- Coercion variables; doesn't much matter
+isOuterTyVar :: TcLevel -> TyCoVar -> Bool
+-- True of a type variable that comes from a
+-- shallower level than the ambient level (tclvl)
+isOuterTyVar tclvl tv
+  | isTyVar tv = tclvl `strictlyDeeperThan` tcTyVarLevel tv
+                        -- Includes CycleBreakerTvs which are meta-tyvars
+  | otherwise  = False  -- Coercion variables; doesn't much matter
 
 -- | Returns Given constraints that might,
 -- potentially, match the given pred. This is used when checking to see if a
@@ -2926,16 +2897,16 @@ bumpStepCountTcS = TcS $ \env -> do { let ref = tcs_count env
                                     ; n <- TcM.readTcRef ref
                                     ; TcM.writeTcRef ref (n+1) }
 
-getUnificationFlag :: TcS Bool
+resetUnificationFlag :: TcS Bool
 -- We are at ambient level i
--- If the unification flag = Just i, set it to Nothing and return True
--- Otherwise return False
-getUnificationFlag
+-- If the unification flag = Just i, reset it to Nothing and return True
+-- Otherwise leave it unchanged and return False
+resetUnificationFlag
   = TcS $ \env ->
     do { let ref = tcs_unif_lvl env
        ; ambient_lvl <- TcM.getTcLevel
        ; mb_lvl <- TcM.readTcRef ref
-       ; TcM.traceTc "getUnificationFlag" $
+       ; TcM.traceTc "resetUnificationFlag" $
          vcat [ text "ambient:" <+> ppr ambient_lvl
               , text "unif_lvl:" <+> ppr mb_lvl ]
        ; case mb_lvl of

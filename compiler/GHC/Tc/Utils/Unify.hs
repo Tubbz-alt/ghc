@@ -37,7 +37,7 @@ module GHC.Tc.Utils.Unify (
   matchExpectedFunKind,
   matchActualFunTySigma, matchActualFunTysRho,
 
-  metaTyVarUpdateOK, occCheckForErrors, MetaTyVarUpdateResult(..),
+  occCheckForErrors, MetaTyVarUpdateResult(..),
   checkTyVarEq, checkTyFamEq, checkTypeEq, AreTypeFamiliesOK(..)
 
   ) where
@@ -1435,9 +1435,9 @@ uUnfilledVar2 origin t_or_k swapped tv1 ty2
     go dflags cur_lvl
       | isTouchableMetaTyVar cur_lvl tv1
       , canSolveByUnification (metaTyVarInfo tv1) ty2
-      , MTVU_OK ty2' <- metaTyVarUpdateOK dflags NoTypeFamilies tv1 ty2
+      , MTVU_OK {} <- checkTyVarEq dflags NoTypeFamilies tv1 ty2
            -- See Note [Prevent unification with type families] about the NoTypeFamilies:
-      = do { co_k <- uType KindLevel kind_origin (tcTypeKind ty2') (tyVarKind tv1)
+      = do { co_k <- uType KindLevel kind_origin (tcTypeKind ty2) (tyVarKind tv1)
            ; traceTc "uUnfilledVar2 ok" $
              vcat [ ppr tv1 <+> dcolon <+> ppr (tyVarKind tv1)
                   , ppr ty2 <+> dcolon <+> ppr (tcTypeKind  ty2)
@@ -1447,8 +1447,8 @@ uUnfilledVar2 origin t_or_k swapped tv1 ty2
                -- Only proceed if the kinds match
                -- NB: tv1 should still be unfilled, despite the kind unification
                --     because tv1 is not free in ty2 (or, hence, in its kind)
-             then do { writeMetaTyVar tv1 ty2'
-                     ; return (mkTcNomReflCo ty2') }
+             then do { writeMetaTyVar tv1 ty2
+                     ; return (mkTcNomReflCo ty2) }
 
              else defer } -- This cannot be solved now.  See GHC.Tc.Solver.Canonical
                           -- Note [Equalities with incompatible kinds]
@@ -1912,73 +1912,6 @@ instance Outputable AreTypeFamiliesOK where
   ppr YesTypeFamilies = text "YesTypeFamilies"
   ppr NoTypeFamilies  = text "NoTypeFamilies"
 
-metaTyVarUpdateOK :: DynFlags
-                  -> AreTypeFamiliesOK   -- allow type families in RHS?
-                  -> TcTyVar             -- tv :: k1
-                  -> TcType              -- ty :: k2
-                  -> MetaTyVarUpdateResult TcType        -- possibly-expanded ty
--- (metaTyVarUpdateOK tv ty)
--- Checks that the equality tv~ty is OK to be used to rewrite
--- other equalities.  Equivalently, checks the conditions for CEqCan
---       (a) that tv doesn't occur in ty (occurs check)
---       (b) that ty does not have any foralls or (perhaps) type functions
---       (c) that ty does not have any blocking coercion holes
---           See Note [Equalities with incompatible kinds] in "GHC.Tc.Solver.Canonical"
---
--- Used in two places:
---   - In the eager unifier: uUnfilledVar2
---   - In the canonicaliser: GHC.Tc.Solver.Canonical.canEqTyVar2
--- Note that in the latter case tv is not necessarily a meta-tyvar,
--- despite the name of this function.
-
--- We have two possible outcomes:
--- (1) Return the type to update the type variable with,
---        [we know the update is ok]
--- (2) Return Nothing,
---        [the update might be dodgy]
---
--- Note that "Nothing" does not mean "definite error".  For example
---   type family F a
---   type instance F Int = Int
--- consider
---   a ~ F a
--- This is perfectly reasonable, if we later get a ~ Int.  For now, though,
--- we return Nothing, leaving it to the later constraint simplifier to
--- sort matters out.
---
--- See Note [Refactoring hazard: metaTyVarUpdateOK]
-
-metaTyVarUpdateOK dflags ty_fam_ok tv rhs_ty
-  = case checkTyVarEq dflags ty_fam_ok tv rhs_ty of
-      _ | bad_tyvar_tv -> MTVU_Bad
-      MTVU_OK _        -> MTVU_OK rhs_ty
-      MTVU_Bad         -> MTVU_Bad          -- forall, predicate, type function
-      MTVU_HoleBlocker -> MTVU_HoleBlocker  -- coercion hole
-      MTVU_Occurs      -> case occCheckExpand [tv] rhs_ty of
-                            Just expanded_ty -> MTVU_OK expanded_ty
-                            Nothing          -> MTVU_Occurs
-  where
-     bad_tyvar_tv, bad_rhs :: Bool
-
-     -- True <=> we have alpha ~ ty, where alpha is a TyVarTv
-     --          and ty is not a tyvar
-     bad_tyvar_tv | MetaTv { mtv_info = TyVarTv } <- tcTyVarDetails tv
-                  = bad_rhs
-                  | otherwise
-                  = False
-
-     -- True <=> RHS is not a tyvar, or
-     -- (if a unification variable) is not a TyVarTv
-     bad_rhs = case tcGetTyVar_maybe rhs_ty of
-        Nothing -> True
-        Just tv -> case tcTyVarDetails tv of
-                      MetaTv { mtv_info = info }
-                                  -> case info of
-                                       TyVarTv -> False
-                                       _       -> True
-                      SkolemTv {} -> False
-                      RuntimeUnk  -> False
-
 checkTyVarEq :: DynFlags -> AreTypeFamiliesOK -> TcTyVar -> TcType -> MetaTyVarUpdateResult ()
 checkTyVarEq dflags ty_fam_ok tv ty
   = inline checkTypeEq dflags ty_fam_ok (TyVarLHS tv) ty
@@ -2002,6 +1935,14 @@ checkTypeEq :: DynFlags -> AreTypeFamiliesOK -> CanEqLHS -> TcType
 --   (d) a blocking coercion hole
 --   (e) an occurrence of the LHS (occurs check)
 --
+-- Note that an occurs-check does not mean "definite error".  For example
+--   type family F a
+--   type instance F Int = Int
+-- consider
+--   b0 ~ F b0
+-- This is perfectly reasonable, if we later get b0 ~ Int.  But we
+-- certainly can't unify b0 := F b0
+--
 -- For (a), (b), and (c) we check only the top level of the type, NOT
 -- inside the kinds of variables it mentions.  For (d) we look deeply
 -- in coercions when the LHS is a tyvar (but skip coercions for type family
@@ -2009,7 +1950,7 @@ checkTypeEq :: DynFlags -> AreTypeFamiliesOK -> CanEqLHS -> TcType
 --
 -- checkTypeEq is called from
 --    * checkTyFamEq, checkTyVarEq (which inline it to specialise away the
---      case-analysis on 'lhs'
+--      case-analysis on 'lhs')
 --    * checkEqCanLHSFinish, which does not know the form of 'lhs'
 checkTypeEq dflags ty_fam_ok lhs ty
   = go ty

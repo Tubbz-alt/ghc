@@ -1674,11 +1674,11 @@ solveWanteds wc@(WC { wc_simple = simples, wc_impl = implics, wc_holes = holes }
                 -- Any insoluble constraints are in 'simples' and so get rewritten
                 -- See Note [Rewrite insolubles] in GHC.Tc.Solver.Monad
 
-       ; (_floated_eqs, implics2) <- solveNestedImplications $
-                                     implics `unionBags` wc_impl wc1
+       ; implics2 <- solveNestedImplications $
+                     implics `unionBags` wc_impl wc1
 
        ; dflags        <- getDynFlags
-       ; unif_happened <- getUnificationFlag
+       ; unif_happened <- resetUnificationFlag
        ; solved_wc <- simpl_loop 0 (solverIterations dflags) unif_happened
                                 (wc1 { wc_impl = implics2 })
 
@@ -1704,17 +1704,12 @@ simpl_loop n limit unif_happened wc@(WC { wc_simple = simples })
          addErrTcS (hang (text "solveWanteds: too many iterations"
                    <+> parens (text "limit =" <+> ppr limit))
                 2 (vcat [ text "Unsolved:" <+> ppr wc
---                        , ppUnless (isEmptyBag floated_eqs) $
---                          text "Floated equalities:" <+> ppr floated_eqs
                         , text "Set limit with -fconstraint-solver-iterations=n; n=0 for no limit"
                   ]))
        ; return wc }
 
   | unif_happened
   = simplify_again n limit True wc
-            -- Put floated_eqs first so they get solved first
-            -- NB: the floated_eqs may include /derived/ equalities
-            -- arising from fundeps inside an implication
 
   | superClassesMightHelp wc
   = -- We still have unsolved goals, and apparently no way to solve them,
@@ -1747,55 +1742,33 @@ simplify_again n limit no_new_given_scs
 
        ; wc1 <- solveSimpleWanteds simples
 
-       ; (_floated_eqs2, implics2) <- solveNestedImplications $
-                                     implics `unionBags` (wc_impl wc1)
-       ; unif_happened <- getUnificationFlag
-       ; simpl_loop (n+1) limit unif_happened (wc1 { wc_impl = implics2 })
+       ; implics2 <- solveNestedImplications $
+                     implics `unionBags` (wc_impl wc1)
 
-{-
-       -- See Note [Cutting off simpl_loop]
-       -- We have already tried to solve the nested implications once
-       -- Try again only if we have unified some meta-variables
-       -- (which is a bit like adding more givens), or we have some
-       -- new Given superclasses
-       ; let new_implics = wc_impl wc1
-       ; if no_new_given_scs  &&
-            isEmptyBag new_implics
-
-           then -- Do not even try to solve the implications
-                simpl_loop (n+1) limit emptyBag (wc1 { wc_impl = implics })
-
-           else -- Try to solve the implications
-                do { (floated_eqs2, implics2) <- solveNestedImplications $
-                                                 implics `unionBags` new_implics
-                   ; simpl_loop (n+1) limit floated_eqs2 (wc1 { wc_impl = implics2 }) }
--}
-   }
+       ; unif_happened <- resetUnificationFlag
+       ; simpl_loop (n+1) limit unif_happened (wc1 { wc_impl = implics2 }) }
 
 solveNestedImplications :: Bag Implication
-                        -> TcS (Cts, Bag Implication)
+                        -> TcS (Bag Implication)
 -- Precondition: the TcS inerts may contain unsolved simples which have
 -- to be converted to givens before we go inside a nested implication.
 solveNestedImplications implics
   | isEmptyBag implics
-  = return (emptyBag, emptyBag)
+  = return (emptyBag)
   | otherwise
   = do { traceTcS "solveNestedImplications starting {" empty
-       ; (floated_eqs_s, unsolved_implics) <- mapAndUnzipBagM solveImplication implics
-       ; let floated_eqs = concatBag floated_eqs_s
+       ; unsolved_implics <- mapBagM solveImplication implics
 
        -- ... and we are back in the original TcS inerts
        -- Notice that the original includes the _insoluble_simples so it was safe to ignore
        -- them in the beginning of this function.
        ; traceTcS "solveNestedImplications end }" $
-                  vcat [ text "all floated_eqs ="  <+> ppr floated_eqs
-                       , text "unsolved_implics =" <+> ppr unsolved_implics ]
+                  vcat [ text "unsolved_implics =" <+> ppr unsolved_implics ]
 
-       ; return (floated_eqs, catBagMaybes unsolved_implics) }
+       ; return (catBagMaybes unsolved_implics) }
 
 solveImplication :: Implication    -- Wanted
-                 -> TcS (Cts,      -- All wanted or derived floated equalities: var = type
-                         Maybe Implication) -- Simplified implication (empty or singleton)
+                 -> TcS (Maybe Implication) -- Simplified implication (empty or singleton)
 -- Precondition: The TcS monad contains an empty worklist and given-only inerts
 -- which after trying to solve this implication we must restore to their original value
 solveImplication imp@(Implic { ic_tclvl  = tclvl
@@ -1806,7 +1779,7 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
                              , ic_info   = info
                              , ic_status = status })
   | isSolvedStatus status
-  = return (emptyCts, Just imp)  -- Do nothing
+  = return (Just imp)  -- Do nothing
 
   | otherwise  -- Even for IC_Insoluble it is worth doing more work
                -- The insoluble stuff might be in one sub-implication
@@ -1828,7 +1801,7 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
                   ; residual_wanted <- solveWanteds wanteds
                         -- solveWanteds, *not* solveWantedsAndDrop, because
                         -- we want to retain derived equalities so we can float
-                        -- them out in floatEqualities
+                        -- them out in floatEqualities.
 
                   ; (has_eqs, given_insols) <- getHasGivenEqs tclvl
                         -- Call getHasGivenEqs /after/ solveWanteds, because
@@ -1836,10 +1809,6 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
                         -- to reveal given superclass equalities
 
                   ; return (has_eqs, given_insols, residual_wanted) }
-
-       ; (floated_eqs, residual_wanted)
-             <- floatEqualities skols given_ids ev_binds_var
-                                has_given_eqs residual_wanted
 
        ; traceTcS "solveImplication 2"
            (ppr given_insols $$ ppr residual_wanted)
@@ -1854,12 +1823,11 @@ solveImplication imp@(Implic { ic_tclvl  = tclvl
        ; tcvs    <- TcS.getTcEvTyCoVars ev_binds_var
        ; traceTcS "solveImplication end }" $ vcat
              [ text "has_given_eqs =" <+> ppr has_given_eqs
-             , text "floated_eqs =" <+> ppr floated_eqs
              , text "res_implic =" <+> ppr res_implic
              , text "implication evbinds =" <+> ppr (evBindMapBinds evbinds)
              , text "implication tvcs =" <+> ppr tcvs ]
 
-       ; return (floated_eqs, res_implic) }
+       ; return res_implic }
 
     -- TcLevels must be strictly increasing (see (ImplicInv) in
     -- Note [TcLevel and untouchable type variables] in GHC.Tc.Utils.TcType),
@@ -2532,6 +2500,7 @@ no evidence for a fundep equality), but equality superclasses do matter (since
 they carry evidence).
 -}
 
+{-
 floatEqualities :: [TcTyVar] -> [EvId] -> EvBindsVar -> HasGivenEqs
                 -> WantedConstraints
                 -> TcS (Cts, WantedConstraints)
@@ -2553,7 +2522,6 @@ floatEqualities :: [TcTyVar] -> [EvId] -> EvBindsVar -> HasGivenEqs
 floatEqualities _ _ _ _ wanteds
   = return (emptyBag, wanteds)
 
-{-
 floatEqualities skols given_ids ev_binds_var has_given_eqs
                 wanteds@(WC { wc_simple = simples })
   | MaybeGivenEqs <- has_given_eqs  -- There are some given equalities, so don't float

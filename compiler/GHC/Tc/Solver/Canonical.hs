@@ -2270,8 +2270,8 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
 
 -- This function handles the case where one side is a tyvar and the other is
 -- a type family application. Which to put on the left?
---   If the tyvar is a meta-tyvar, put it on the left, as this may be our only
---   shot to unify.
+--   If the tyvar is a touchable meta-tyvar, put it on the left, as this may
+--   be our only shot to unify.
 --   Otherwise, put the function on the left, because it's generally better to
 --   rewrite away function calls. This makes types smaller. And it seems necessary:
 --     [W] F alpha ~ alpha
@@ -2279,8 +2279,6 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
 --     [W] G alpha beta ~ Int   ( where we have type instance G a a = a )
 --   If we end up with a stuck alpha ~ F alpha, we won't be able to solve this.
 --   Test case: indexed-types/should_compile/CEqCanOccursCheck
--- It would probably work to always put the variable on the left, but we think
--- it would be less efficient.
 canEqTyVarFunEq :: CtEvidence               -- :: lhs ~ (rhs |> mco)
                                             -- or (rhs |> mco) ~ lhs if swapped
                 -> EqRel -> SwapFlag
@@ -2342,7 +2340,11 @@ unifyTest ev tv1 rhs
 
      does_not_escape tv_lvl fv
        | isTyVar fv = tv_lvl `deeperThanOrSame` tcTyVarLevel fv
-       | otherwise  = True   -- Coercion variables
+       | otherwise  = True
+       -- Coercion variables are not an escape risk
+       -- If an implication binds a coercion variable, it'll have equalities,
+       -- so the "intervening given equalities" test above will catch it
+       -- Coercion holes get filled with coercions, so again no problem.
 
      is_promotable fv
        | isTyVar fv
