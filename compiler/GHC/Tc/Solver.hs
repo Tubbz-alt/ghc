@@ -1773,7 +1773,6 @@ solveImplication :: Implication    -- Wanted
 -- which after trying to solve this implication we must restore to their original value
 solveImplication imp@(Implic { ic_tclvl  = tclvl
                              , ic_binds  = ev_binds_var
-                             , ic_skols  = skols
                              , ic_given  = given_ids
                              , ic_wanted = wanteds
                              , ic_info   = info
