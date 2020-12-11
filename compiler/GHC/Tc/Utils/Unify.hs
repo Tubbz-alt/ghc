@@ -1466,6 +1466,7 @@ uUnfilledVar2 origin t_or_k swapped tv1 ty2
     defer = unSwap swapped (uType_defer t_or_k origin) ty1 ty2
 
 canSolveByUnification :: MetaInfo -> TcType -> Bool
+-- See Note [When unification can happen]
 canSolveByUnification info xi
   = case info of
       CycleBreakerTv -> False
@@ -1523,8 +1524,76 @@ lhsPriority tv
                                      TauTv          -> 2
                                      RuntimeUnkTv   -> 3
 
-{- Note [TyVar/TyVar orientation]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [When unification can happen]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Question: given a homogeneous equality (alpha ~# ty), where
+"homogenous" means both sides have the same kind, when is it OK to
+unify alpha := ty?
+
+There are three reasons not to unify:
+
+(SKOL-ESC) Skolem-escape
+  Consider the constraint
+       forall[2] a[2]. alpha[1] ~ Maybe a[2]
+  If we unify alpha := Maybe a, the skolem 'a' may escape its scope.
+  The level alpha[1] says that alpha may be used outside this constraint,
+  where 'a' is not in scope at all.  So we must not unify.
+
+  Bottom line: when looking at a constraint alpha[n] := ty, do not unify
+  if any free varaible of 'ty' has level deeper (greater) than n
+
+(GIVEN-EQ) Given equalities
+  Consider the constraint
+       forall[2] a[2]. b[1] ~ Int => alpha[1] ~ Int
+  There is no (SKOL-ESC) problem with unifying alpha := Int, but it might
+  not be the principal solution. Perhpas the "right" solution is alpha := b.
+  We simply can't tell.  See "OutsideIn(X): modular type inference with local
+  assumptions", section 2.2.
+
+  Bottom line: at amibient level 'l', when looking at a constraint
+  alpha[n] ~ ty, do not unify alpha := ty if there are any given equalities
+  between levels 'n' and 'l'.
+
+(TYVAR-TV) Unifying TyVarTvs
+  When considering alpha{tyv} ~ ty, if alpha{tyv} is a TyVarTv it can
+  only unify with a type variable, not with a structured type.  So if
+  'ty' is a structured type, such as (Maybe x), don't unify.
+
+
+Needless to say, all three have wrinkles:
+
+* (SKOL-ESC) Promotion.  Given alpha[n] ~ ty, what if beta[k] is free
+  in 'ty', where beta is a unification variable, and k>n?  'beta'
+  stands for a monotype, and since it is part of a level-n type
+  (equal to alpha[n]), we must /promote/ beta to level n.  Just make
+  up a fresh gamma[n], and unify beta[k] := gamma[n].
+
+* (TYVAR-TV) Unification variables.  Suppose alpha[tyv,n] is a level-n
+  TyVarTv (see Note [Signature skolems] in GHC.Tc.Types.TcType)? Now
+  consider alpha[tyv,n] ~ Bool.  We don't want to unify because that
+  would break the TyVarTv invariant.
+
+  What about alpha[tyv,n] ~ beta[tau,n], where beta is an ordinary
+  TauTv?  Again, don't unify, because beta might later be unified
+  with, say Bool.  (If levels permit, we reverse the orientation here;
+  see Note [TyVar/TyVar orientation].)
+
+* (GIVEN-EQ) Given equalites.  When considering (alpha[n] ~ ty), how
+  do we know whether there are any given equalities between level n
+  and the ambient level.  We answer in two ways:
+
+  * In the eager unifier, we only unify if l=n.  If not, we say that
+    alpha is "untouchable", and defer to the constraint solver.
+    This check is made in GHC.Tc.Utils.uUnifilledVar2, in the guard
+    isTouchableMetaTyVar.
+
+  * In the constraint solver, we track where Given equalities occur
+    and use that to guard unification in GHC.Tc.Solver.Canonical.unifyTest
+    More details in Note [Tracking given equalities in the solver]
+
+
+Note [TyVar/TyVar orientation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Given (a ~ b), should we orient the CEqCan as (a~b) or (b~a)?
 This is a surprisingly tricky question! This is invariant (TyEq:TV).
 
@@ -1649,11 +1718,9 @@ But, to my surprise, it didn't seem to make any significant difference
 to the compiler's performance, so I didn't take it any further.  Still
 it seemed too nice to discard altogether, so I'm leaving these
 notes.  SLPJ Jan 18.
--}
 
-
-{- Note [Prevent unification with type families]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Prevent unification with type families]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We prevent unification with type families because of an uneasy compromise.
 It's perfectly sound to unify with type families, and it even improves the
 error messages in the testsuite. It also modestly improves performance, at
